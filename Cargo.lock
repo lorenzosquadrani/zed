@@ -12864,12 +12864,14 @@ name = "pdf_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "client",
  "clock",
  "db",
  "extension",
  "file_icons",
  "fs",
+ "futures 0.3.32",
  "gpui",
  "hayro",
  "http_client",
@@ -12888,6 +12890,15 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+]
+
+[[package]]
+name = "pdf_viewer_benchmarks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "hayro",
 ]
 
 [[package]]

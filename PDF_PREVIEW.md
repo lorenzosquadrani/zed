@@ -97,10 +97,14 @@ does not need Hayro, PDFium, or a graphical environment.
 ## Validation
 
 The full Zed development binary and the x86-64 musl remote server build
-successfully. All nine PDF tests pass, including a 20-seed sweep of the GPUI
+successfully. All 15 PDF tests pass, including a 20-seed sweep of the GPUI
 tests. They cover rasterized content and
 color order, invalid input, bitmap bounds, visible-page caching, direct-file
 workspace opening, navigation, reload recovery, and Ctrl + wheel zoom behavior.
+Regression tests also cover scroll-back image identity, zero raster requests on
+zoom-out, coalesced zoom refinement with the old image still visible, stale
+reload results, LRU eviction, entry/pixel budgets, capped-resolution reuse,
+indexed visibility, and worker shutdown.
 Formatting and launcher syntax checks pass. The included two-page fixture was
 also opened and its rendered text inspected in the native Wayland app on this
 host during initial local-preview validation.
@@ -110,8 +114,8 @@ the actual headless-server request handler. It checks remote loading (even with
 a conflicting local filename), automatic reload after atomic file replacement,
 error recovery, manual reload,
 and rejected oversized, missing, or directory inputs. Bounded local reads are
-also tested. A connection to your real SSH host still needs to be verified after
-restarting the development editor.
+also tested. The user has confirmed that the corrected development build connects
+to the real SSH host and previews remote PDFs successfully.
 
 ```sh
 ./script/pdf-dev run crates/pdf_viewer/fixtures/preview.pdf
@@ -121,6 +125,79 @@ restarting the development editor.
 This is focused feature validation, not a run of Zed's complete test suite or a
 PDF compatibility corpus. The GPUI test skill guided deterministic scheduler
 and input-event coverage.
+
+## Performance checks
+
+The usable local/remote preview checkpoint is commit `b00d76d7c4` on
+`pdf-preview`. Performance changes build on that checkpoint without changing
+the remote protocol. The existing remote development server can still be reused
+with `ZED_BUILD_REMOTE_SERVER=never`.
+
+The isolated `pdf_viewer_benchmarks` package compiles the production raster code
+without GPUI or any `test-support` dependencies. The wrapper checks the feature
+graph and bounds each benchmark invocation to five minutes. Build first, then
+run smoke, quick, and measured modes:
+
+```sh
+./script/pdf-dev cargo bench -p pdf_viewer_benchmarks --bench raster --profile release-fast --no-run
+./script/pdf-dev bench --test
+./script/pdf-dev bench --quick
+./script/pdf-dev bench
+```
+
+The fixed generated PDFs contain 1, 100, or 1000 pages with text and vector
+plots. Each measurement renders the last page, alternating 100% and 125% zoom.
+It compares reconstructing the document/cache on each render (the checkpoint's
+strategy) with retaining them (the worker's strategy), using identical raster
+code. Before timing it asserts identical pixels and dimensions in both paths.
+Fixture construction and those assertions are outside timing.
+
+This is a CPU raster microbenchmark, not a full historical-checkout comparison
+or a frame-latency benchmark. It excludes SSH, worker scheduling, BGRA conversion,
+GPUI layout, GPU uploads, and display presentation. The deterministic GPUI tests
+separately check raster-request counts and image reuse through zoom/scroll/reload.
+Neither test scheduler timings nor these raster numbers measure real display
+frame rates. Benchmark results are stored locally under `target/criterion`.
+
+For the actual development profile, set `PDF_BENCH_PROFILE=dev` inside Toolbox:
+
+```sh
+./script/pdf-dev env PDF_BENCH_PROFILE=dev ./script/pdf-dev bench --quick
+```
+
+Set `PDF_BENCH_UNOPTIMIZED=1` alongside `PDF_BENCH_PROFILE=dev` to override the
+new dependency optimization levels back to zero for comparison, without editing
+the workspace or changing the application build defaults. Use separate Criterion
+baseline names when comparing profiles, and do not run measured benchmarks
+alongside a build or another benchmark.
+
+Targeted development-profile overrides optimize the PDF rasterizer, font/path
+libraries, and viewer code without building all of Zed in release mode. Shared
+library changes can require a larger one-time incremental rebuild.
+
+Measured on this Linux host on 2026-09-07, using Rust 1.97.1, the same benchmark
+source/lockfile, the `dev` profile, the 100-page fixture, 10 samples, 500 ms warmup,
+and a 2 s measurement target (Criterion extended the slow cases to collect ten
+samples). The baseline uses `PDF_BENCH_UNOPTIMIZED=1`; the candidate uses the
+default dependency overrides. Runs were sequential after the editor build, not
+concurrent with compilation. Values are Criterion's reported estimate intervals:
+
+| Raster strategy | Unoptimized dependencies | Optimized dependencies |
+| --- | --- | --- |
+| Recreate document/cache each render | 631.59–667.07 ms | 22.704–24.079 ms |
+| Retain document/cache | 662.51–735.66 ms | 23.004–25.069 ms |
+
+For the old-versus-new strategy this is roughly 647 ms versus 24 ms per raster,
+about 96% less time on this fixture. Cache reuse alone did not consistently
+reduce raster time here; eliminating redundant raster requests and optimizing
+the CPU libraries are the main wins. Earlier quick runs ranged around 300 ms
+versus 11 ms, so absolute timings clearly vary with host conditions. This is
+not a guarantee for arbitrary PDFs or a measurement of end-to-end UI latency.
+
+The final measured baselines are `unoptimized-dev-full` and
+`optimized-dev-full`. The GPUI benchmark skill guided feature isolation and
+sequential measurements; the GPUI test skill guided fake-time zoom/reload tests
+and 20-seed scheduling checks rather than wall-clock assertions.
 
 ## Controls
 
@@ -144,12 +221,30 @@ Ctrl + mouse wheel also zooms. Ordinary scrolling pans the document. The
 
 The renderer is [Hayro](https://github.com/LaurenzV/hayro), a Rust PDF rasterizer
 with embedded fallback fonts. It does not need a separate PDFium installation.
-Parsing and rasterization run on the background executor, with one raster job
-in flight per view. Only visible page bitmaps are retained; GPU images are
-released when pages leave the viewport, the document changes, or the tab closes.
-Output bitmaps are capped at 2048 pixels per side and the visible bitmap budget
-is 128 MiB per pane, excluding renderer working memory and GPU copies. High zoom
-levels can therefore show reduced sharpness. Input files are limited to 128 MiB.
+Each open document has a dedicated background worker that owns its parsed PDF
+and Hayro rendering cache. Split panes share this worker. A bounded request
+channel and one outstanding request per view limit queued work; the worker does
+not block the foreground executor or shared background threads while idle.
+
+Each pane retains recently viewed bitmaps in a least-recently-used cache. Zoom
+scales the previous bitmap immediately; higher-resolution refinement waits for
+a 100 ms pause in zoom events. Zooming out reuses a higher-resolution image.
+Cache matching uses effective pixel dimensions, so zooming beyond the raster
+cap does not repeatedly render identical images. Document reloads invalidate
+both parsed state and bitmaps, and discard results from the old document.
+
+Output bitmaps are capped at 2048 pixels per side. The retained bitmap budget
+is 128 MiB per pane, excluding renderer working memory, GPU copies, and one
+in-flight output bitmap. The cache also limits entries to 128, or the visible
+page count if larger. Images are released on eviction, reload, or tab closure.
+Scrolling back can still need rendering after eviction; this is intentional
+to bound memory. High zoom levels can show reduced sharpness. Input files are
+limited to 128 MiB. Hayro's parsed structures and font/image caches have no
+separate byte budget and are released when their document worker closes.
+
+Page positions are indexed once per document. Visibility and current-page
+lookup use binary search, navigation uses indexed offsets, and only visible
+page elements are laid out, preserving the full document scroll extent.
 
 This is a visual preview. Text selection, search, annotations, SyncTeX, password
 entry, and collaborative-session PDF sharing are not implemented. Hayro is still developing

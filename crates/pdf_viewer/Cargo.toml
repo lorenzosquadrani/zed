@@ -14,9 +14,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 db.workspace = true
 file_icons.workspace = true
 gpui.workspace = true
+futures.workspace = true
 hayro = "0.7.1"
 image.workspace = true
 project.workspace = true

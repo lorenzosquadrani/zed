@@ -1,3 +1,5 @@
+mod geometry;
+mod raster;
 mod renderer;
 
 use std::{
@@ -9,6 +11,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use file_icons::FileIcons;
+use geometry::PageGeometry;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement, Render, RenderImage, ScrollHandle, SharedString, Styled,
@@ -16,6 +19,7 @@ use gpui::{
 };
 use project::{Project, ProjectEntryId, ProjectPath};
 use renderer::PageSize;
+use renderer::RasterSize;
 use ui::{ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 use workspace::{
@@ -50,6 +54,15 @@ actions!(
 
 const PAGE_GAP: f32 = 16.0;
 const MAX_CACHED_PIXELS: usize = 32 * 1024 * 1024;
+const MAX_CACHED_PAGES: usize = 128;
+const ZOOM_DEBOUNCE: Duration = Duration::from_millis(100);
+
+struct LoadedPdf {
+    bytes: Arc<Vec<u8>>,
+    pages: Vec<PageSize>,
+    geometry: PageGeometry,
+    renderer: Arc<renderer::Renderer>,
+}
 
 pub struct PdfItem {
     project: Entity<Project>,
@@ -58,6 +71,8 @@ pub struct PdfItem {
     entry_id: Option<ProjectEntryId>,
     bytes: Arc<Vec<u8>>,
     pages: Vec<PageSize>,
+    geometry: PageGeometry,
+    renderer: Arc<renderer::Renderer>,
     error: Option<String>,
     reload_task: Task<()>,
     _subscription: Subscription,
@@ -66,18 +81,21 @@ pub struct PdfItem {
 impl EventEmitter<()> for PdfItem {}
 
 impl PdfItem {
-    fn load(
-        project: &Entity<Project>,
-        path: &ProjectPath,
-        cx: &App,
-    ) -> Task<Result<(Arc<Vec<u8>>, Vec<PageSize>)>> {
+    fn load(project: &Entity<Project>, path: &ProjectPath, cx: &App) -> Task<Result<LoadedPdf>> {
         let load = project
             .read(cx)
             .read_binary_file(path, renderer::MAX_FILE_SIZE, cx);
+        let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
             let bytes = Arc::new(load.await?);
-            let pages = renderer::metadata(bytes.clone())?;
-            Ok((bytes, pages))
+            let (renderer, pages) = renderer::Renderer::new(bytes.clone(), &executor).await?;
+            let geometry = PageGeometry::new(&pages);
+            Ok(LoadedPdf {
+                bytes,
+                pages,
+                geometry,
+                renderer,
+            })
         })
     }
 
@@ -93,9 +111,11 @@ impl PdfItem {
             let result = task.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok((bytes, pages)) => {
-                        this.bytes = bytes;
-                        this.pages = pages;
+                    Ok(loaded) => {
+                        this.bytes = loaded.bytes;
+                        this.pages = loaded.pages;
+                        this.geometry = loaded.geometry;
+                        this.renderer = loaded.renderer;
                         this.entry_id = this
                             .project
                             .read(cx)
@@ -134,7 +154,7 @@ impl project::ProjectItem for PdfItem {
         let project = project.clone();
         let path = path.clone();
         Some(cx.spawn(async move |cx| {
-            let (bytes, pages) = task.await?;
+            let loaded = task.await?;
             Ok(cx.new(|cx| {
                 let subscription = cx.subscribe(&project, |this: &mut Self, project, event, cx| {
                     if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event {
@@ -163,8 +183,10 @@ impl project::ProjectItem for PdfItem {
                     path,
                     abs_path,
                     entry_id,
-                    bytes,
-                    pages,
+                    bytes: loaded.bytes,
+                    pages: loaded.pages,
+                    geometry: loaded.geometry,
+                    renderer: loaded.renderer,
                     error: None,
                     reload_task: Task::ready(()),
                     _subscription: subscription,
@@ -184,6 +206,28 @@ impl project::ProjectItem for PdfItem {
     }
 }
 
+struct CachedPage {
+    size: RasterSize,
+    image: Result<Arc<RenderImage>, String>,
+    last_used: u64,
+}
+
+impl CachedPage {
+    fn pixels(&self) -> usize {
+        if self.image.is_ok() {
+            self.size.pixels()
+        } else {
+            0
+        }
+    }
+
+    fn satisfies(&self, size: RasterSize, max_dimension: u16) -> bool {
+        self.size.covers(size)
+            && self.size.width <= max_dimension
+            && self.size.height <= max_dimension
+    }
+}
+
 pub struct PdfViewer {
     item: Entity<PdfItem>,
     focus_handle: FocusHandle,
@@ -193,8 +237,13 @@ pub struct PdfViewer {
     render_scale: f32,
     raster_dimension: u16,
     generation: usize,
-    pages: BTreeMap<usize, Result<Arc<RenderImage>, String>>,
+    pages: BTreeMap<usize, CachedPage>,
+    cache_clock: u64,
+    visible: std::ops::Range<usize>,
     render_task: Option<Task<()>>,
+    zoom_task: Option<Task<()>>,
+    #[cfg(test)]
+    raster_requests: usize,
     _subscription: Subscription,
 }
 
@@ -217,7 +266,12 @@ impl PdfViewer {
             raster_dimension: renderer::MAX_DIMENSION,
             generation: 0,
             pages: BTreeMap::new(),
+            cache_clock: 0,
+            visible: 0..0,
             render_task: None,
+            zoom_task: None,
+            #[cfg(test)]
+            raster_requests: 0,
             _subscription: subscription,
         }
     }
@@ -225,7 +279,7 @@ impl PdfViewer {
     fn clear_pages(&mut self, cx: &mut App) {
         for image in std::mem::take(&mut self.pages)
             .into_values()
-            .filter_map(Result::ok)
+            .filter_map(|page| page.image.ok())
         {
             cx.drop_image(image, None);
         }
@@ -233,6 +287,7 @@ impl PdfViewer {
 
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
+        self.zoom_task = None;
         self.clear_pages(cx);
         cx.notify();
     }
@@ -240,13 +295,7 @@ impl PdfViewer {
     fn scale(&self, cx: &App) -> f32 {
         if self.fit_width {
             let width = f32::from(self.scroll.bounds().size.width);
-            let page_width = self
-                .item
-                .read(cx)
-                .pages
-                .iter()
-                .map(|page| page.width)
-                .fold(1.0_f32, f32::max);
+            let page_width = self.item.read(cx).geometry.max_width;
             if width > PAGE_GAP * 2.0 {
                 ((width - PAGE_GAP * 2.0) / page_width).clamp(0.1, 4.0)
             } else {
@@ -262,26 +311,12 @@ impl PdfViewer {
         // viewport, so its top cannot always be scrolled to the pane's top.
         let offset = -f32::from(self.scroll.offset().y)
             + (f32::from(self.scroll.bounds().size.height) / 2.0).max(PAGE_GAP);
-        let mut bottom = PAGE_GAP;
-        for (index, page) in self.item.read(cx).pages.iter().enumerate() {
-            bottom += page.height * self.scale(cx) + PAGE_GAP;
-            if bottom > offset {
-                return index;
-            }
-        }
-        self.item.read(cx).pages.len().saturating_sub(1)
+        self.item.read(cx).geometry.page_at(self.scale(cx), offset)
     }
 
     fn go_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let page = page.min(self.item.read(cx).pages.len().saturating_sub(1));
-        let offset: f32 = self
-            .item
-            .read(cx)
-            .pages
-            .iter()
-            .take(page)
-            .map(|page| page.height * self.scale(cx) + PAGE_GAP)
-            .sum();
+        let offset = self.item.read(cx).geometry.top(page, self.scale(cx)) - PAGE_GAP;
         self.scroll.set_offset(point(px(0.0), px(-offset)));
         cx.notify();
     }
@@ -300,55 +335,126 @@ impl PdfViewer {
         let render_scale = scale * window.scale_factor();
         let top = -f32::from(self.scroll.offset().y);
         let height = f32::from(self.scroll.bounds().size.height).max(1.0);
-        let needed = visible_pages(&self.item.read(cx).pages, scale, top, height);
+        let needed = self.item.read(cx).geometry.visible(scale, top, height);
         let raster_dimension = raster_dimension(needed.len());
         if (render_scale - self.render_scale).abs() > 0.01
             || raster_dimension != self.raster_dimension
         {
+            let was_initialized = self.render_scale != 0.0;
             self.render_scale = render_scale;
             self.raster_dimension = raster_dimension;
-            self.invalidate(cx);
-        }
-        let obsolete: Vec<_> = self
-            .pages
-            .keys()
-            .copied()
-            .filter(|index| !needed.contains(index))
-            .collect();
-        for index in obsolete {
-            if let Some(Ok(image)) = self.pages.remove(&index) {
-                cx.drop_image(image, None);
+            if was_initialized && (!self.pages.is_empty() || self.render_task.is_some()) {
+                // Keep showing the previous bitmap while wheel events settle.
+                // Changing zoom does not invalidate document content.
+                self.zoom_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(ZOOM_DEBOUNCE).await;
+                    this.update(cx, |this, cx| {
+                        this.zoom_task = None;
+                        cx.notify();
+                    })
+                    .log_err();
+                }));
             }
         }
-        if self.render_task.is_some() || self.item.read(cx).error.is_some() {
+        self.visible = needed.clone();
+        self.cache_clock += 1;
+        for index in needed.clone() {
+            if let Some(page) = self.pages.get_mut(&index) {
+                page.last_used = self.cache_clock;
+            }
+        }
+        if self.render_task.is_some()
+            || self.zoom_task.is_some()
+            || self.item.read(cx).error.is_some()
+        {
             return;
         }
-        let Some(index) = needed
-            .into_iter()
-            .find(|index| !self.pages.contains_key(index))
+        let Some((index, size)) = needed
+            .map(|index| {
+                (
+                    index,
+                    RasterSize::for_page(
+                        self.item.read(cx).pages[index],
+                        render_scale,
+                        raster_dimension,
+                    ),
+                )
+            })
+            .find(|(index, size)| {
+                !self
+                    .pages
+                    .get(index)
+                    .is_some_and(|page| page.satisfies(*size, raster_dimension))
+            })
         else {
             return;
         };
-        let bytes = self.item.read(cx).bytes.clone();
+        let renderer = self.item.read(cx).renderer.clone();
         let generation = self.generation;
+        #[cfg(test)]
+        {
+            self.raster_requests += 1;
+        }
         // Keep a single raster job in flight even when zoom or scroll changes.
         // Dropping a task cannot interrupt synchronous PDF interpretation.
         self.render_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    renderer::render_page(bytes, index, render_scale, raster_dimension)
-                        .map_err(|error| format!("{error:#}"))
-                })
-                .await;
+            let result = renderer
+                .render(index, size)
+                .await
+                .map_err(|error| format!("{error:#}"));
             this.update(cx, |this, cx| {
                 this.render_task = None;
                 if this.generation == generation {
-                    this.pages.insert(index, result);
+                    this.insert_page(index, size, result, cx);
                 }
                 cx.notify();
             })
             .log_err();
         }));
+    }
+
+    fn insert_page(
+        &mut self,
+        index: usize,
+        size: RasterSize,
+        image: Result<Arc<RenderImage>, String>,
+        cx: &mut App,
+    ) {
+        if let Some(previous) = self.pages.remove(&index) {
+            if let Ok(image) = previous.image {
+                cx.drop_image(image, None);
+            }
+        }
+        self.pages.insert(
+            index,
+            CachedPage {
+                size,
+                image,
+                last_used: self.cache_clock,
+            },
+        );
+        let mut pixels: usize = self.pages.values().map(CachedPage::pixels).sum();
+        while pixels > MAX_CACHED_PIXELS
+            || self.pages.len() > MAX_CACHED_PAGES.max(self.visible.len())
+        {
+            // Evict off-screen least-recently-used images first. A very zoomed
+            // out viewport can also require replacing oversized visible images.
+            let Some(index) = self
+                .pages
+                .iter()
+                .filter(|(candidate, _)| **candidate != index)
+                .min_by_key(|(index, page)| (self.visible.contains(*index), page.last_used))
+                .map(|(index, _)| *index)
+            else {
+                break;
+            };
+            if let Some(page) = self.pages.remove(&index) {
+                pixels -= page.pixels();
+                if let Ok(image) = page.image {
+                    cx.drop_image(image, None);
+                }
+            }
+        }
     }
 
     fn scroll_wheel(
@@ -366,21 +472,18 @@ impl PdfViewer {
                 );
             }
             cx.stop_propagation();
+        } else {
+            // Refresh the virtualized range in the scroll event's next frame,
+            // rather than waiting for the post-paint bounds observer.
+            cx.notify();
         }
     }
 }
 
+#[cfg(test)]
 fn visible_pages(pages: &[PageSize], scale: f32, top: f32, height: f32) -> Vec<usize> {
-    let mut offset = PAGE_GAP;
-    pages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, page)| {
-            let bottom = offset + page.height * scale;
-            let visible = bottom >= top && offset <= top + height;
-            offset = bottom + PAGE_GAP;
-            visible.then_some(index)
-        })
+    PageGeometry::new(pages)
+        .visible(scale, top, height)
         .collect()
 }
 
@@ -403,15 +506,20 @@ impl Render for PdfViewer {
         let current = self.current_page(cx);
         let item = self.item.read(cx);
         let count = item.pages.len();
-        let mut content = v_flex()
-            .gap(px(PAGE_GAP))
-            .p(px(PAGE_GAP))
-            .items_center()
+        let mut content = div()
+            .relative()
+            .w(px(item.geometry.max_width * scale + PAGE_GAP * 2.0))
+            .h(px(item.geometry.height(scale)))
             .min_w_full()
             .min_h_full()
             .on_scroll_wheel(cx.listener(Self::scroll_wheel));
-        for (index, page) in item.pages.iter().enumerate() {
-            let page_content = match self.pages.get(&index) {
+        // Absolute page positions preserve the full scroll extent without
+        // laying out thousands of off-screen placeholders on every frame.
+        for index in self.visible.clone() {
+            let Some(page) = item.pages.get(index) else {
+                continue;
+            };
+            let page_content = match self.pages.get(&index).map(|page| &page.image) {
                 Some(Ok(image)) => img(image.clone()).size_full().into_any_element(),
                 Some(Err(error)) => Label::new(error.clone())
                     .color(Color::Error)
@@ -422,14 +530,24 @@ impl Render for PdfViewer {
             };
             content = content.child(
                 div()
-                    .flex_none()
-                    .w(px(page.width * scale))
+                    .absolute()
+                    .top(px(item.geometry.top(index, scale)))
+                    .left(px(PAGE_GAP))
+                    .right(px(PAGE_GAP))
                     .h(px(page.height * scale))
-                    .bg(gpui::white())
                     .flex()
-                    .items_center()
                     .justify_center()
-                    .child(page_content),
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(page.width * scale))
+                            .h(px(page.height * scale))
+                            .bg(gpui::white())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(page_content),
+                    ),
             );
         }
         let error = item.error.clone();
@@ -759,6 +877,233 @@ mod persistence {
 mod tests {
     use super::*;
 
+    async fn cached_preview(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<PdfViewer>, &mut gpui::VisualTestContext) {
+        use fs::Fs as _;
+        use project::ProjectItem as _;
+        use util::rel_path::rel_path;
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/project"))
+            .await
+            .expect("directory");
+        fs.insert_file(
+            "/project/test.pdf",
+            renderer::tests::sample_pdf().as_ref().clone(),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("test.pdf").into(),
+        };
+        let item = cx
+            .update(|cx| PdfItem::try_open(&project, &path, cx))
+            .expect("opener")
+            .await
+            .expect("PDF opens");
+        let (viewer, cx) = cx.add_window_view(|_, cx| {
+            let mut viewer = PdfViewer::new(item, cx);
+            viewer.fit_width = false;
+            viewer
+        });
+        cx.simulate_resize(gpui::size(px(240.0), px(220.0)));
+        viewer.update(cx, |viewer, cx| viewer.set_zoom(1.0, cx));
+        (viewer, cx)
+    }
+
+    fn draw_pdf(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn settle_pdf(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..5 {
+            draw_pdf(cx);
+            cx.executor().advance_clock(ZOOM_DEBOUNCE);
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn reuses_pages_when_scrolling_and_zooming(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = cached_preview(cx).await;
+        settle_pdf(cx);
+        let first_image = viewer.read_with(cx, |viewer, _| {
+            viewer.pages[&0].image.as_ref().expect("page").id
+        });
+        let position = viewer.read_with(cx, |viewer, _| viewer.scroll.bounds().center());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-320.0))),
+            ..Default::default()
+        });
+        settle_pdf(cx);
+        let rendered = viewer.read_with(cx, |viewer, cx| {
+            assert!(
+                !viewer.visible.contains(&0),
+                "first page is fully off-screen: visible {:?}, offset {:?}, bounds {:?}, scale {}, total height {}",
+                viewer.visible, viewer.scroll.offset(), viewer.scroll.bounds(), viewer.scale(cx), viewer.item.read(cx).geometry.height(viewer.scale(cx))
+            );
+            assert_eq!(
+                viewer.pages[&0].image.as_ref().expect("retained page").id,
+                first_image
+            );
+            viewer.raster_requests
+        });
+        viewer.update(cx, |viewer, cx| viewer.go_to_page(0, cx));
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(
+                viewer.raster_requests, rendered,
+                "scroll-back must not rasterize again"
+            );
+            assert_eq!(
+                viewer.pages[&0].image.as_ref().expect("page").id,
+                first_image
+            );
+        });
+        viewer.update(cx, |viewer, cx| viewer.set_zoom(0.8, cx));
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(
+                viewer.raster_requests, rendered,
+                "zoom-out reuses higher resolution"
+            )
+        });
+        for zoom in [1.2, 1.3, 1.5] {
+            viewer.update(cx, |viewer, cx| viewer.set_zoom(zoom, cx));
+            draw_pdf(cx);
+            viewer.read_with(cx, |viewer, _| {
+                assert_eq!(
+                    viewer.pages[&0]
+                        .image
+                        .as_ref()
+                        .expect("fallback remains visible")
+                        .id,
+                    first_image
+                );
+                assert_eq!(viewer.raster_requests, rendered, "wheel burst is debounced");
+            });
+        }
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(
+                viewer.raster_requests,
+                rendered + 1,
+                "only the final zoom needs a new bitmap: cached {:?}, scale {}, pending zoom {}",
+                viewer.pages[&0].size,
+                viewer.render_scale,
+                viewer.zoom_task.is_some()
+            );
+            assert_ne!(
+                viewer.pages[&0].image.as_ref().expect("refined page").id,
+                first_image
+            );
+        });
+
+        // Invalidate after queuing a raster but before the worker completes.
+        viewer.update(cx, |viewer, cx| {
+            viewer.invalidate(cx);
+        });
+        cx.update(|window, cx| {
+            viewer.update(cx, |viewer, cx| {
+                viewer.request_pages(window, cx);
+                assert!(viewer.render_task.is_some());
+                viewer.invalidate(cx);
+                // Pause replacement rendering so automatic window frames cannot
+                // fill the cache with a valid new-generation result in this check.
+                viewer.item.update(cx, |item, _| {
+                    item.error = Some("Reloading test document".into())
+                });
+            })
+        });
+        cx.run_until_parked();
+        viewer.read_with(cx, |viewer, _| {
+            assert!(
+                viewer.pages.is_empty(),
+                "old document result must not enter new cache"
+            )
+        });
+        viewer.update(cx, |viewer, cx| {
+            viewer.item.update(cx, |item, _| item.error = None)
+        });
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| assert!(!viewer.pages.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn evicts_lru_pages_within_bitmap_and_entry_budgets(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = cached_preview(cx).await;
+        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::new(2048, 2048)
+        )]));
+        viewer.update(cx, |viewer, cx| {
+            viewer.visible = 0..1;
+            for index in 0..10 {
+                viewer.cache_clock += 1;
+                viewer.insert_page(
+                    index,
+                    RasterSize {
+                        width: 2048,
+                        height: 2048,
+                    },
+                    Ok(image.clone()),
+                    cx,
+                );
+                assert!(
+                    viewer.pages.values().map(CachedPage::pixels).sum::<usize>()
+                        <= MAX_CACHED_PIXELS
+                );
+            }
+            assert_eq!(viewer.pages.len(), 8);
+            assert!(viewer.pages.contains_key(&0), "visible page is protected");
+            assert!(
+                !viewer.pages.contains_key(&1),
+                "oldest off-screen page was evicted"
+            );
+            assert!(!viewer.pages.contains_key(&2));
+            assert!(viewer.pages.contains_key(&9));
+            viewer.clear_pages(cx);
+            let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::new(1, 1)
+            )]));
+            for index in 0..150 {
+                viewer.cache_clock += 1;
+                viewer.insert_page(
+                    index,
+                    RasterSize {
+                        width: 1,
+                        height: 1,
+                    },
+                    Ok(image.clone()),
+                    cx,
+                );
+            }
+            assert_eq!(viewer.pages.len(), MAX_CACHED_PAGES);
+            assert!(viewer.pages.contains_key(&0));
+            viewer.invalidate(cx);
+            assert!(viewer.pages.is_empty());
+        });
+    }
+
     #[gpui::test]
     async fn opens_a_pdf_as_a_single_file_workspace(cx: &mut gpui::TestAppContext) {
         use fs::{FakeFs, Fs as _};
@@ -888,11 +1233,11 @@ mod tests {
                 !viewer.pages.is_empty(),
                 "visible PDF pages must be rendered"
             );
-            assert!(viewer.pages.values().all(Result::is_ok));
+            assert!(viewer.pages.values().all(|page| page.image.is_ok()));
             let allocated: usize = viewer
                 .pages
                 .values()
-                .filter_map(|result| result.as_ref().ok())
+                .filter_map(|page| page.image.as_ref().ok())
                 .filter_map(|image| image.as_bytes(0))
                 .map(|bytes| bytes.len())
                 .sum();

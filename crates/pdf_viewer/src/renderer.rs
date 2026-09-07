@@ -1,80 +1,92 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, ensure};
-use gpui::RenderImage;
-use hayro::{RenderCache, RenderSettings, hayro_interpret::InterpreterSettings, hayro_syntax::Pdf};
+use anyhow::{Context as _, Result};
+use futures::channel::oneshot;
+use gpui::{BackgroundExecutor, RenderImage, Task};
+use hayro::RenderCache;
 use image::Frame;
 use smallvec::smallvec;
 
-// Keep each output bitmap within the texture atlas limits and 16 MiB.
-pub const MAX_DIMENSION: u16 = 2048;
-pub const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024;
+use crate::raster;
+pub use raster::{MAX_DIMENSION, MAX_FILE_SIZE, PageSize, RasterSize};
 
-#[derive(Clone, Copy, Debug)]
-pub struct PageSize {
-    pub width: f32,
-    pub height: f32,
-}
-
-fn open(bytes: Arc<Vec<u8>>) -> Result<Pdf> {
-    Pdf::new(bytes)
-        .map_err(|error| anyhow!("Cannot open PDF (it may require a password): {error:?}"))
-}
-
-pub fn metadata(bytes: Arc<Vec<u8>>) -> Result<Vec<PageSize>> {
-    let document = open(bytes)?;
-    ensure!(!document.pages().is_empty(), "This PDF has no pages");
-    document
-        .pages()
-        .iter()
-        .map(|page| {
-            let (width, height) = page.render_dimensions();
-            ensure!(
-                width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
-                "This PDF contains invalid page dimensions"
-            );
-            Ok(PageSize { width, height })
-        })
-        .collect()
-}
-
-fn bounded_scale(size: PageSize, scale: f32, max_dimension: u16) -> f32 {
-    scale
-        .min(f32::from(max_dimension) / size.width)
-        .min(f32::from(max_dimension) / size.height)
-}
-
-pub fn render_page(
-    bytes: Arc<Vec<u8>>,
+struct Request {
     index: usize,
-    scale: f32,
-    max_dimension: u16,
-) -> Result<Arc<RenderImage>> {
-    let document = open(bytes)?;
-    let page = document
-        .pages()
-        .get(index)
-        .ok_or_else(|| anyhow!("PDF page does not exist"))?;
-    let (width, height) = page.render_dimensions();
-    ensure!(
-        width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
-        "Invalid PDF page dimensions"
-    );
-    ensure!(scale.is_finite() && scale > 0.0, "Invalid PDF zoom");
-    let max_dimension = max_dimension.clamp(1, MAX_DIMENSION);
-    let scale = bounded_scale(PageSize { width, height }, scale, max_dimension);
-    let pixmap = hayro::render(
-        page,
-        &RenderCache::new(),
-        &InterpreterSettings::default(),
-        &RenderSettings {
-            x_scale: scale,
-            y_scale: scale,
-            width: Some((width * scale).ceil().clamp(1.0, f32::from(max_dimension)) as u16),
-            height: Some((height * scale).ceil().clamp(1.0, f32::from(max_dimension)) as u16),
-            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-        },
-    );
+    size: RasterSize,
+    response: oneshot::Sender<Result<Arc<RenderImage>>>,
+}
+
+pub struct Renderer {
+    requests: async_channel::Sender<Request>,
+    _worker: Task<()>,
+}
+
+impl Renderer {
+    pub async fn new(
+        bytes: Arc<Vec<u8>>,
+        executor: &BackgroundExecutor,
+    ) -> Result<(Arc<Self>, Vec<PageSize>)> {
+        let (requests, receiver) = async_channel::bounded::<Request>(1);
+        let (initialized, ready) = oneshot::channel();
+        // Hayro's cache borrows the document and contains Rc/RefCell values.
+        // Keep both on the same dedicated executor, including across awaits;
+        // neither is sent between threads or protected by unsafe Send impls.
+        let worker = executor.spawn_dedicated(move |_| async move {
+            let document = match raster::open(bytes) {
+                Ok(document) => document,
+                Err(error) => {
+                    if initialized.send(Err(error)).is_err() {
+                        return;
+                    }
+                    return;
+                }
+            };
+            let pages = raster::metadata(&document);
+            let valid = pages.is_ok();
+            if initialized.send(pages).is_err() || !valid {
+                return;
+            }
+            let cache = RenderCache::new();
+            while let Ok(request) = receiver.recv().await {
+                if request.response.is_canceled() {
+                    continue;
+                }
+                let result = raster::render_page(&document, &cache, request.index, request.size)
+                    .and_then(render_image);
+                // A view may close during synchronous interpretation. Its
+                // canceled response is expected, not a worker failure.
+                if request.response.send(result).is_err() {
+                    continue;
+                }
+            }
+        });
+        let renderer = Arc::new(Self {
+            requests,
+            _worker: worker,
+        });
+        let pages = ready
+            .await
+            .context("PDF renderer stopped while opening document")??;
+        Ok((renderer, pages))
+    }
+
+    pub async fn render(&self, index: usize, size: RasterSize) -> Result<Arc<RenderImage>> {
+        let (response, result) = oneshot::channel();
+        self.requests
+            .send(Request {
+                index,
+                size,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("PDF renderer stopped"))?;
+        result
+            .await
+            .context("PDF renderer stopped while rendering page")?
+    }
+}
+
+fn render_image(pixmap: hayro::vello_cpu::Pixmap) -> Result<Arc<RenderImage>> {
     // GPUI uploads premultiplied BGRA; Hayro produces premultiplied RGBA.
     let pixels = pixmap
         .data()
@@ -82,13 +94,66 @@ pub fn render_page(
         .flat_map(|pixel| [pixel.b, pixel.g, pixel.r, pixel.a])
         .collect();
     let buffer = image::RgbaImage::from_raw(pixmap.width().into(), pixmap.height().into(), pixels)
-        .ok_or_else(|| anyhow!("Invalid rendered PDF bitmap"))?;
+        .context("Invalid rendered PDF bitmap")?;
     Ok(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use raster::{bounded_scale, open};
+
+    #[test]
+    fn capped_zoom_uses_identical_raster_dimensions() {
+        let page = PageSize {
+            width: 640.0,
+            height: 800.0,
+        };
+        let capped = RasterSize::for_page(page, 3.0, MAX_DIMENSION);
+        assert_eq!(capped, RasterSize::for_page(page, 4.0, MAX_DIMENSION));
+        assert!(capped.covers(RasterSize::for_page(page, 1.0, MAX_DIMENSION)));
+        assert!(capped.pixels() <= usize::from(MAX_DIMENSION).pow(2));
+    }
+
+    #[gpui::test]
+    async fn worker_reuses_document_and_shuts_down(cx: &mut gpui::TestAppContext) {
+        let (renderer, pages) = Renderer::new(sample_pdf(), &cx.executor())
+            .await
+            .expect("worker opens PDF");
+        let size = RasterSize::for_page(pages[0], 1.0, MAX_DIMENSION);
+        let first = renderer.render(0, size).await.expect("first render");
+        let second = renderer
+            .render(0, size)
+            .await
+            .expect("cached interpreter render");
+        assert_eq!(first.as_bytes(0), second.as_bytes(0));
+        assert!(renderer.render(100, size).await.is_err());
+        let weak = Arc::downgrade(&renderer);
+        drop(renderer);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "worker must not retain its owner");
+    }
+
+    fn metadata(bytes: Arc<Vec<u8>>) -> Result<Vec<PageSize>> {
+        raster::metadata(&open(bytes)?)
+    }
+
+    fn render_page(
+        bytes: Arc<Vec<u8>>,
+        index: usize,
+        scale: f32,
+        max_dimension: u16,
+    ) -> Result<Arc<RenderImage>> {
+        let document = open(bytes)?;
+        let pages = raster::metadata(&document)?;
+        let page = pages.get(index).context("page does not exist")?;
+        render_image(raster::render_page(
+            &document,
+            &RenderCache::new(),
+            index,
+            RasterSize::for_page(*page, scale, max_dimension),
+        )?)
+    }
 
     pub fn sample_pdf() -> Arc<Vec<u8>> {
         let objects = [

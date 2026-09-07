@@ -27,6 +27,7 @@ case "$command" in
     server-smoke) exec bash "$repo_dir/script/pdf-server-smoke" "$@" ;;
     check) exec cargo check -p pdf_viewer -p zed -p remote_server "$@" ;;
     test) exec cargo test -p pdf_viewer "$@" ;;
+    bench) exec bash "$repo_dir/script/pdf-bench" "$@" ;;
     fmt) exec cargo fmt -p pdf_viewer -p project -p proto -p remote_server "$@" ;;
     run)
         export XDG_CONFIG_HOME="$repo_dir/target/pdf-preview/config"

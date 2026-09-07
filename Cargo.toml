@@ -158,6 +158,7 @@ members = [
     "crates/path",
     "crates/paths",
     "crates/pdf_viewer",
+    "crates/pdf_viewer_benchmarks",
     "crates/picker",
     "crates/picker_preview",
     "crates/platform_title_bar",
@@ -1038,6 +1039,16 @@ proc-macro2 = { opt-level = 3 }
 tree-sitter = { opt-level = 3 }
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
+# CPU PDF rasterization is interactive even in development builds.
+pdf_viewer = { opt-level = 1 }
+hayro = { opt-level = 3 }
+hayro-interpret = { opt-level = 3 }
+hayro-syntax = { opt-level = 3 }
+vello_cpu = { opt-level = 3 }
+vello_common = { opt-level = 3 }
+kurbo = { opt-level = 3 }
+skrifa = { opt-level = 3 }
+read-fonts = { opt-level = 3 }
 wasmtime = { opt-level = 3 }
 cranelift-codegen = { opt-level = 3 }
 wasmtime-environ = { opt-level = 3 }

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+if [[ ! -f /run/.toolboxenv ]]; then
+    exec "$repo_dir/script/pdf-dev" bash "$repo_dir/script/pdf-bench" "$@"
+fi
+cd "$repo_dir"
+feature_tree=$(cargo tree -p pdf_viewer_benchmarks -e normal,build,dev,features)
+if grep -F 'feature "test-support"' <<< "$feature_tree"; then
+    echo 'PDF benchmark must not enable test-support' >&2
+    exit 1
+fi
+benchmark_profile=${PDF_BENCH_PROFILE:-release-fast}
+cargo_options=()
+if [[ ${PDF_BENCH_UNOPTIMIZED:-0} == 1 ]]; then
+    if [[ $benchmark_profile != dev ]]; then
+        echo 'PDF_BENCH_UNOPTIMIZED requires PDF_BENCH_PROFILE=dev' >&2
+        exit 1
+    fi
+    for package in hayro hayro-interpret hayro-syntax vello_cpu vello_common kurbo skrifa read-fonts; do
+        cargo_options+=(--config "profile.dev.package.$package.opt-level=0")
+    done
+fi
+exec timeout --kill-after=5s 300s cargo "${cargo_options[@]}" bench -p pdf_viewer_benchmarks --bench raster --profile "$benchmark_profile" -- "$@"
