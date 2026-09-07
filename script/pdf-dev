@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+export CARGO_HOME="$repo_dir/target/local-tools/cargo"
+export RUSTUP_HOME="$repo_dir/target/local-tools/rustup"
+export PATH="$CARGO_HOME/bin:$PATH"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=0
+export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}"
+export ZED_UPDATE_EXPLANATION="This is your local PDF preview development build. Rebuild with script/pdf-dev build."
+
+if [[ ! -f /run/.toolboxenv ]]; then
+    exec toolbox run --container zed-pdf-dev bash "$repo_dir/script/pdf-dev" "$@"
+fi
+
+cd "$repo_dir"
+command=${1:-run}
+if [[ $# -gt 0 ]]; then shift; fi
+case "$command" in
+    build) exec cargo build -p zed "$@" ;;
+    server)
+        export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+        exec cargo build -p remote_server --features debug-embed --target-dir target/remote_server --target x86_64-unknown-linux-musl "$@"
+        ;;
+    server-smoke) exec bash "$repo_dir/script/pdf-server-smoke" "$@" ;;
+    check) exec cargo check -p pdf_viewer -p zed -p remote_server "$@" ;;
+    test) exec cargo test -p pdf_viewer "$@" ;;
+    fmt) exec cargo fmt -p pdf_viewer -p project -p proto -p remote_server "$@" ;;
+    run)
+        export XDG_CONFIG_HOME="$repo_dir/target/pdf-preview/config"
+        export XDG_CACHE_HOME="$repo_dir/target/pdf-preview/cache"
+        exec "$repo_dir/target/debug/zed" --user-data-dir "$repo_dir/target/pdf-preview/data" "$@"
+        ;;
+    *) exec "$command" "$@" ;;
+esac

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+server_binary=${1:-"$repo_dir/target/remote_server/x86_64-unknown-linux-musl/debug/remote_server"}
+smoke_dir=$(mktemp -d /tmp/zed-pdf-server-smoke.XXXXXX)
+
+# Moving only the working directory is insufficient: asset discovery also walks
+# the executable's ancestors, which would still find the development checkout.
+if [[ $server_binary == *.gz ]]; then
+    gzip -dc -- "$server_binary" > "$smoke_dir/remote_server"
+    chmod +x "$smoke_dir/remote_server"
+else
+    cp --reflink=auto -- "$server_binary" "$smoke_dir/remote_server"
+fi
+export XDG_CONFIG_HOME="$smoke_dir/config"
+export XDG_DATA_HOME="$smoke_dir/data"
+export XDG_CACHE_HOME="$smoke_dir/cache"
+export XDG_STATE_HOME="$smoke_dir/state"
+cd "$smoke_dir"
+
+status=0
+timeout --kill-after=2s 5s ./remote_server run \
+    --log-file "$smoke_dir/server.log" \
+    --pid-file "$smoke_dir/server.pid" \
+    --stdin-socket "$smoke_dir/stdin.sock" \
+    --stdout-socket "$smoke_dir/stdout.sock" \
+    --stderr-socket "$smoke_dir/stderr.sock" || status=$?
+
+if [[ $status != 124 ]] || ! grep -q 'accepting new connections' "$smoke_dir/server.log" \
+    || grep -Eq 'panicked|app is shut down' "$smoke_dir/server.log"; then
+    printf 'Standalone server startup failed; inspect %s/server.log\n' "$smoke_dir" >&2
+    exit 1
+fi
+
+printf 'Standalone server startup passed; logs and binary retained in %s\n' "$smoke_dir"

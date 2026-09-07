@@ -1,0 +1,46 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/pdf_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+db.workspace = true
+file_icons.workspace = true
+gpui.workspace = true
+hayro = "0.7.1"
+image.workspace = true
+project.workspace = true
+smallvec.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+client = { workspace = true, features = ["test-support"] }
+clock = { workspace = true, features = ["test-support"] }
+db = { workspace = true, features = ["test-support"] }
+extension.workspace = true
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+node_runtime.workspace = true
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+remote = { workspace = true, features = ["test-support"] }
+remote_server = { workspace = true, features = ["test-support"] }
+semver.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

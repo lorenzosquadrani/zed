@@ -311,6 +311,7 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_trust_worktrees);
         session.add_entity_request_handler(Self::handle_restrict_worktrees);
         session.add_entity_request_handler(Self::handle_download_file_by_path);
+        session.add_entity_request_handler(Self::handle_read_project_file);
 
         session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
         session.add_entity_request_handler(BufferStore::handle_update_buffer);
@@ -744,6 +745,30 @@ impl HeadlessProject {
             trusted_worktrees.restrict(worktree_store, restricted_paths, cx);
         });
         Ok(proto::Ack {})
+    }
+
+    pub async fn handle_read_project_file(
+        this: Entity<Self>,
+        message: TypedEnvelope<proto::ReadProjectFile>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadProjectFileResponse> {
+        let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
+        let path = RelPath::from_unix_str(&message.payload.path)?;
+        let (fs, abs_path) = this.read_with(&cx, |this, cx| {
+            let worktree = this
+                .worktree_store
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .context("File worktree is no longer available")?;
+            anyhow::Ok((this.fs.clone(), worktree.read(cx).absolutize(path)))
+        })?;
+        let data = cx
+            .background_spawn(async move {
+                project::binary_file::read_bounded_file(&fs, &abs_path, message.payload.max_bytes)
+                    .await
+            })
+            .await?;
+        Ok(proto::ReadProjectFileResponse { data })
     }
 
     pub async fn handle_download_file_by_path(
