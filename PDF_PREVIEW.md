@@ -4,7 +4,50 @@ This fork opens local and SSH-remote `.pdf` files in native Zed tabs. It support
 scrolling, previous/next/first/last page navigation, zoom, fit to width, split
 panes, restoring PDF tabs on restart, and automatic reload after file changes.
 
-## Run on Fedora Atomic
+## Install and update the normal host app
+
+From the host, outside Toolbox:
+
+```sh
+./script/pdf-install
+```
+
+This tests and builds an optimized `release-fast` editor and a static x86-64
+Linux SSH server inside the existing `zed-pdf-dev` Toolbox, then replaces only
+`~/.local/zed.app`. The `zed` command and desktop launcher start this native
+host app; Toolbox is not involved at runtime. No host packages are installed.
+Close Zed before the replacement step. If it is still open, the script leaves
+the build staged; quit Zed and run `./script/pdf-install --install-only`.
+
+Your existing settings, extensions, workspace database, and application data
+are preserved. The build retains the normal app ID and stable database scope
+for that purpose, but its source is this fork's **main**, not an official stable
+release. Official binary auto-updates are disabled so they cannot overwrite
+the PDF feature. A matching compressed server is bundled and uploaded on the
+first SSH connection for each changed server build, then reused on reconnect.
+The installed app needs neither the source checkout nor Rust to connect.
+Only x86-64 Linux remotes are bundled by this setup.
+
+For subsequent updates, commit any local work, then run this one command:
+
+```sh
+./script/pdf-install --update
+```
+
+It requires a clean `main`, fetches official `upstream/main`, merges it, runs
+PDF tests across 20 scheduler seeds plus SSH transport tests, builds the app,
+and checks standalone server startup and host libraries before installation.
+A merge conflict is aborted and reported; a test/build failure leaves the
+installed app untouched (a successful source merge remains in local `main`).
+This is deliberately a manual command, not a scheduled task. It never pushes
+or creates pull requests. After a successful update, publish your source with
+`git push origin main` when ready. `--build-only` stages without installing.
+
+The first optimized build is substantially slower than later incremental
+builds. Build artifacts stay under `target/`; the installed app includes
+dependency licenses and a `commit` file identifying its source revision.
+
+## Separate development build on Fedora Atomic
 
 The development environment is a rootless Fedora Toolbox named `zed-pdf-dev`.
 Build dependencies are installed inside that container. Rust and Cargo's
@@ -17,8 +60,8 @@ downloads are under `target/local-tools` in this repository.
 
 `run` launches `target/debug/zed` directly, with separate settings, cache, and
 application data under `target/pdf-preview`. Your existing `zed` command still
-launches your independently installed editor. No host package layering or
-replacement of that installation is needed.
+launches the normal host installation (the fork after using `pdf-install`).
+Use this separate profile only for development experiments.
 
 ```sh
 ./script/pdf-dev check

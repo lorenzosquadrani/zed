@@ -39,6 +39,33 @@ use util::{
 /// How long to wait for SSH to connect when no askpass prompt has opened.
 const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);
 
+async fn bundled_server(
+    executable: &Path,
+    platform: RemotePlatform,
+) -> Result<Option<(PathBuf, String)>> {
+    let directory = executable
+        .parent()
+        .context("Editor executable has no parent directory")?;
+    let archive = directory.join(format!(
+        "remote-server-{}-{}.gz",
+        platform.os, platform.arch
+    ));
+    match fs::metadata(&archive).await {
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "Bundled remote server is not a file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Checking bundled remote server"),
+    }
+    let checksum = fs::read_to_string(archive.with_extension("sha256"))
+        .await
+        .context("Reading bundled remote server checksum")?;
+    let checksum = checksum.trim();
+    anyhow::ensure!(
+        checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid bundled remote server checksum"
+    );
+    Ok(Some((archive, checksum.to_ascii_lowercase())))
+}
+
 pub(crate) struct SshRemoteConnection {
     socket: SshSocket,
     master_process: Mutex<Option<MasterProcess>>,
@@ -837,6 +864,38 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        if let Some((archive, checksum)) =
+            bundled_server(&std::env::current_exe()?, self.ssh_platform).await?
+        {
+            // A personal build cannot download its server from Zed's release
+            // service. Content-address the bundled server so an update gets
+            // a matching binary, while reconnections avoid another upload.
+            let destination = remote_server_dir_relative().join(RelPath::from_unix_str(&format!(
+                "zed-remote-server-dev-{checksum}"
+            ))?);
+            if self
+                .socket
+                .run_command(
+                    self.ssh_shell_kind,
+                    &destination.display(self.path_style()),
+                    &["version"],
+                    true,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(destination.into());
+            }
+            let temporary = remote_server_dir_relative().join(RelPath::from_unix_str(&format!(
+                "download-{}-{checksum}.gz",
+                std::process::id()
+            ))?);
+            self.upload_local_server_binary(&archive, &temporary, delegate, cx)
+                .await?;
+            self.extract_server_binary(&destination, &temporary, delegate, cx)
+                .await?;
+            return Ok(destination.into());
+        }
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -2071,6 +2130,37 @@ fn build_command_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovers_only_matching_bundled_remote_servers() -> Result<()> {
+        let directory = TempDir::new()?;
+        let executable = directory.path().join("zed-editor");
+        let platform = RemotePlatform {
+            os: RemoteOs::Linux,
+            arch: RemoteArch::X86_64,
+        };
+        assert!(smol::block_on(bundled_server(&executable, platform))?.is_none());
+        let archive = directory.path().join("remote-server-linux-x86_64.gz");
+        std::fs::write(&archive, b"archive fixture")?;
+        assert!(smol::block_on(bundled_server(&executable, platform)).is_err());
+        std::fs::write(archive.with_extension("sha256"), "../not-a-checksum")?;
+        assert!(smol::block_on(bundled_server(&executable, platform)).is_err());
+        let checksum = "a".repeat(64);
+        std::fs::write(archive.with_extension("sha256"), format!("{checksum}\n"))?;
+        let bundle = smol::block_on(bundled_server(&executable, platform))?.context("bundle")?;
+        assert_eq!(bundle, (archive, checksum));
+        assert!(
+            smol::block_on(bundled_server(
+                &executable,
+                RemotePlatform {
+                    os: RemoteOs::Linux,
+                    arch: RemoteArch::Aarch64
+                }
+            ))?
+            .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_build_command() -> Result<()> {
