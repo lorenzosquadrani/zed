@@ -3,6 +3,10 @@
 This fork opens local and SSH-remote `.pdf` files in native Zed tabs. It supports continuous
 scrolling, previous/next/first/last page navigation, zoom, fit to width, split
 panes, restoring PDF tabs on restart, and automatic reload after file changes.
+Clicking an internal link in a PDF page, including linked table-of-contents
+entries, scrolls to its target page and section. Link regions follow zoom,
+fit to width, page cropping, and rotation, and update after a file reload.
+The PDF must contain embedded internal links for this navigation to work.
 
 ## Install and update the normal host app
 
@@ -139,11 +143,14 @@ does not need Hayro, PDFium, or a graphical environment.
 
 ## Validation
 
-The full Zed development binary and the x86-64 musl remote server build
-successfully. All 15 PDF tests pass, including a 20-seed sweep of the GPUI
-tests. They cover rasterized content and
+Compilation checks pass for the Zed editor, PDF viewer, and remote server.
+Formatting and PDF viewer Clippy checks pass. All 23 PDF tests pass, including
+a 20-seed sweep of the GPUI tests. They cover rasterized content and
 color order, invalid input, bitmap bounds, visible-page caching, direct-file
 workspace opening, navigation, reload recovery, and Ctrl + wheel zoom behavior.
+Internal-link tests cover named and explicit destinations, cropped and rotated
+pages, clicking contents entries at different zoom settings and fit to width,
+and destination changes after reload.
 Regression tests also cover scroll-back image identity, zero raster requests on
 zoom-out, coalesced zoom refinement with the old image still visible, stale
 reload results, LRU eviction, entry/pixel budgets, capped-resolution reuse,

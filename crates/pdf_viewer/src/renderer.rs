@@ -7,7 +7,7 @@ use hayro::RenderCache;
 use image::Frame;
 use smallvec::smallvec;
 
-use crate::raster;
+use crate::{links, raster};
 pub use raster::{MAX_DIMENSION, MAX_FILE_SIZE, PageSize, RasterSize};
 
 struct Request {
@@ -21,11 +21,16 @@ pub struct Renderer {
     _worker: Task<()>,
 }
 
+pub struct DocumentMetadata {
+    pub pages: Vec<PageSize>,
+    pub links: Vec<Vec<links::PageLink>>,
+}
+
 impl Renderer {
     pub async fn new(
         bytes: Arc<Vec<u8>>,
         executor: &BackgroundExecutor,
-    ) -> Result<(Arc<Self>, Vec<PageSize>)> {
+    ) -> Result<(Arc<Self>, DocumentMetadata)> {
         let (requests, receiver) = async_channel::bounded::<Request>(1);
         let (initialized, ready) = oneshot::channel();
         // Hayro's cache borrows the document and contains Rc/RefCell values.
@@ -42,9 +47,12 @@ impl Renderer {
                     return;
                 }
             };
-            let pages = raster::metadata(&document);
-            let valid = pages.is_ok();
-            if initialized.send(pages).is_err() || !valid {
+            let metadata = raster::metadata(&document).map(|pages| DocumentMetadata {
+                pages,
+                links: links::read(&document),
+            });
+            let valid = metadata.is_ok();
+            if initialized.send(metadata).is_err() || !valid {
                 return;
             }
             let cache = RenderCache::new();
@@ -65,10 +73,10 @@ impl Renderer {
             requests,
             _worker: worker,
         });
-        let pages = ready
+        let metadata = ready
             .await
             .context("PDF renderer stopped while opening document")??;
-        Ok((renderer, pages))
+        Ok((renderer, metadata))
     }
 
     pub async fn render(&self, index: usize, size: RasterSize) -> Result<Arc<RenderImage>> {
@@ -118,10 +126,10 @@ pub(super) mod tests {
 
     #[gpui::test]
     async fn worker_reuses_document_and_shuts_down(cx: &mut gpui::TestAppContext) {
-        let (renderer, pages) = Renderer::new(sample_pdf(), &cx.executor())
+        let (renderer, metadata) = Renderer::new(sample_pdf(), &cx.executor())
             .await
             .expect("worker opens PDF");
-        let size = RasterSize::for_page(pages[0], 1.0, MAX_DIMENSION);
+        let size = RasterSize::for_page(metadata.pages[0], 1.0, MAX_DIMENSION);
         let first = renderer.render(0, size).await.expect("first render");
         let second = renderer
             .render(0, size)
@@ -167,6 +175,20 @@ pub(super) mod tests {
                 format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len())
             },
         ];
+        pdf_with_objects(&objects)
+    }
+
+    pub fn linked_pdf() -> Arc<Vec<u8>> {
+        pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [(chapter) [4 0 R /XYZ 0 500 null]] >> >> >>".into(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Annots [5 0 R] >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 600] >>".into(),
+            "<< /Type /Annot /Subtype /Link /Rect [10 240 110 270] /A << /S /GoTo /D (chapter) >> >>".into(),
+        ])
+    }
+
+    pub fn pdf_with_objects(objects: &[String]) -> Arc<Vec<u8>> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -174,12 +196,18 @@ pub(super) mod tests {
             bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
         }
         let xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
         for offset in offsets {
             bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         bytes.extend_from_slice(
-            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
         );
         Arc::new(bytes)
     }

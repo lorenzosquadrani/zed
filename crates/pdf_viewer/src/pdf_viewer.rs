@@ -1,4 +1,5 @@
 mod geometry;
+mod links;
 mod raster;
 mod renderer;
 
@@ -60,6 +61,7 @@ const ZOOM_DEBOUNCE: Duration = Duration::from_millis(100);
 struct LoadedPdf {
     bytes: Arc<Vec<u8>>,
     pages: Vec<PageSize>,
+    links: Vec<Vec<links::PageLink>>,
     geometry: PageGeometry,
     renderer: Arc<renderer::Renderer>,
 }
@@ -71,6 +73,7 @@ pub struct PdfItem {
     entry_id: Option<ProjectEntryId>,
     bytes: Arc<Vec<u8>>,
     pages: Vec<PageSize>,
+    links: Vec<Vec<links::PageLink>>,
     geometry: PageGeometry,
     renderer: Arc<renderer::Renderer>,
     error: Option<String>,
@@ -88,11 +91,12 @@ impl PdfItem {
         let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
             let bytes = Arc::new(load.await?);
-            let (renderer, pages) = renderer::Renderer::new(bytes.clone(), &executor).await?;
-            let geometry = PageGeometry::new(&pages);
+            let (renderer, metadata) = renderer::Renderer::new(bytes.clone(), &executor).await?;
+            let geometry = PageGeometry::new(&metadata.pages);
             Ok(LoadedPdf {
                 bytes,
-                pages,
+                pages: metadata.pages,
+                links: metadata.links,
                 geometry,
                 renderer,
             })
@@ -114,6 +118,7 @@ impl PdfItem {
                     Ok(loaded) => {
                         this.bytes = loaded.bytes;
                         this.pages = loaded.pages;
+                        this.links = loaded.links;
                         this.geometry = loaded.geometry;
                         this.renderer = loaded.renderer;
                         this.entry_id = this
@@ -185,6 +190,7 @@ impl project::ProjectItem for PdfItem {
                     entry_id,
                     bytes: loaded.bytes,
                     pages: loaded.pages,
+                    links: loaded.links,
                     geometry: loaded.geometry,
                     renderer: loaded.renderer,
                     error: None,
@@ -318,6 +324,23 @@ impl PdfViewer {
         let page = page.min(self.item.read(cx).pages.len().saturating_sub(1));
         let offset = self.item.read(cx).geometry.top(page, self.scale(cx)) - PAGE_GAP;
         self.scroll.set_offset(point(px(0.0), px(-offset)));
+        cx.notify();
+    }
+
+    fn go_to_destination(&mut self, destination: links::Destination, cx: &mut Context<Self>) {
+        let item = self.item.read(cx);
+        let Some(page) = item.pages.get(destination.page) else {
+            return;
+        };
+        let scale = self.scale(cx);
+        let content_width = (item.geometry.max_width * scale + PAGE_GAP * 2.0)
+            .max(f32::from(self.scroll.bounds().size.width));
+        let left = (content_width - page.width * scale) / 2.0;
+        let horizontal_offset = (left + destination.x * scale - PAGE_GAP).max(0.0);
+        let vertical_offset =
+            item.geometry.top(destination.page, scale) - PAGE_GAP + destination.y * scale;
+        self.scroll
+            .set_offset(point(px(-horizontal_offset), px(-vertical_offset)));
         cx.notify();
     }
 
@@ -528,6 +551,35 @@ impl Render for PdfViewer {
                     .color(Color::Muted)
                     .into_any_element(),
             };
+            let mut page_element = div()
+                .id(("pdf-page", index))
+                .relative()
+                .flex_none()
+                .w(px(page.width * scale))
+                .h(px(page.height * scale))
+                .bg(gpui::white())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(page_content);
+            for (link_index, link) in item.links.get(index).into_iter().flatten().enumerate() {
+                let destination = link.destination;
+                page_element = page_element.child(
+                    div()
+                        .id(("pdf-link", link_index))
+                        .absolute()
+                        .left(px(link.bounds.x0 as f32 * scale))
+                        .top(px(link.bounds.y0 as f32 * scale))
+                        .w(px(link.bounds.width() as f32 * scale))
+                        .h(px(link.bounds.height() as f32 * scale))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.go_to_destination(destination, cx);
+                            cx.stop_propagation();
+                        })),
+                );
+            }
             content = content.child(
                 div()
                     .absolute()
@@ -537,17 +589,7 @@ impl Render for PdfViewer {
                     .h(px(page.height * scale))
                     .flex()
                     .justify_center()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(page.width * scale))
-                            .h(px(page.height * scale))
-                            .bg(gpui::white())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(page_content),
-                    ),
+                    .child(page_element),
             );
         }
         let error = item.error.clone();
@@ -880,6 +922,13 @@ mod tests {
     async fn cached_preview(
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<PdfViewer>, &mut gpui::VisualTestContext) {
+        preview_with_bytes(renderer::tests::sample_pdf(), cx).await
+    }
+
+    async fn preview_with_bytes(
+        bytes: Arc<Vec<u8>>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<PdfViewer>, &mut gpui::VisualTestContext) {
         use fs::Fs as _;
         use project::ProjectItem as _;
         use util::rel_path::rel_path;
@@ -893,11 +942,8 @@ mod tests {
         fs.create_dir(Path::new("/project"))
             .await
             .expect("directory");
-        fs.insert_file(
-            "/project/test.pdf",
-            renderer::tests::sample_pdf().as_ref().clone(),
-        )
-        .await;
+        fs.insert_file("/project/test.pdf", bytes.as_ref().clone())
+            .await;
         let project = Project::test(fs, [Path::new("/project")], cx).await;
         let worktree_id = project.read_with(cx, |project, cx| {
             project
@@ -940,6 +986,66 @@ mod tests {
             cx.executor().advance_clock(ZOOM_DEBOUNCE);
             cx.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    async fn clicking_contents_link_jumps_to_section(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = preview_with_bytes(renderer::tests::linked_pdf(), cx).await;
+        settle_pdf(cx);
+        let origin = viewer.read_with(cx, |viewer, _| viewer.scroll.bounds().origin);
+        cx.simulate_click(origin + point(px(176.0), px(61.0)), Default::default());
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(viewer.scroll.offset().y, px(-416.0));
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_contents_link_after_zoom_and_fit_width(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = preview_with_bytes(renderer::tests::linked_pdf(), cx).await;
+        viewer.update(cx, |viewer, cx| viewer.set_zoom(0.5, cx));
+        settle_pdf(cx);
+        let origin = viewer.read_with(cx, |viewer, _| viewer.scroll.bounds().origin);
+        cx.simulate_click(origin + point(px(100.0), px(38.5)), Default::default());
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(viewer.scroll.offset().y, px(-216.0))
+        });
+
+        viewer.update(cx, |viewer, cx| {
+            viewer.fit_width = true;
+            viewer.go_to_page(0, cx);
+        });
+        settle_pdf(cx);
+        let origin = viewer.read_with(cx, |viewer, _| viewer.scroll.bounds().origin);
+        cx.simulate_click(origin + point(px(99.2), px(39.4)), Default::default());
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(viewer.scroll.offset().y, px(-224.0))
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_contents_link_uses_reloaded_destination(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = preview_with_bytes(renderer::tests::linked_pdf(), cx).await;
+        settle_pdf(cx);
+        let fs = viewer.read_with(cx, |viewer, cx| {
+            viewer.item.read(cx).project.read(cx).fs().as_fake()
+        });
+        let replacement = String::from_utf8(renderer::tests::linked_pdf().as_ref().clone())
+            .expect("ASCII fixture")
+            .replace("/XYZ 0 500 null", "/XYZ 0 450 null");
+        fs.insert_file("/project/test.pdf", replacement.into_bytes())
+            .await;
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        settle_pdf(cx);
+        let origin = viewer.read_with(cx, |viewer, _| viewer.scroll.bounds().origin);
+        cx.simulate_click(origin + point(px(176.0), px(61.0)), Default::default());
+        settle_pdf(cx);
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(viewer.scroll.offset().y, px(-466.0))
+        });
     }
 
     #[gpui::test]
