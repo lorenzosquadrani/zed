@@ -31,6 +31,7 @@ impl Renderer {
         // Hayro's cache borrows the document and contains Rc/RefCell values.
         // Keep both on the same dedicated executor, including across awaits;
         // neither is sent between threads or protected by unsafe Send impls.
+        let executor = executor.scheduler_executor();
         let worker = executor.spawn_dedicated(move |_| async move {
             let document = match raster::open(bytes) {
                 Ok(document) => document,
